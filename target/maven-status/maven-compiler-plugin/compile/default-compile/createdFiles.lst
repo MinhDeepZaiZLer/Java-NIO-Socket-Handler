@@ -1,10 +1,13 @@
 com\proxy\cache\CacheManager$SingletonHelper.class
 com\proxy\main\ClientHandler.class
+com\proxy\cache\BlacklistManager.class
+com\proxy\io\TunnelingHelper.class
 com\example\App.class
 com\proxy\cache\CachedResponse.class
 com\proxy\io\TunnelingHelper$TransferData.class
+com\proxy\data\BlockedHostDAO.class
 com\proxy\core\HttpRequestProcessor.class
 com\proxy\io\ConnectionEstablisher.class
-com\proxy\io\TunnelingHelper.class
 com\proxy\cache\CacheManager.class
+com\proxy\cache\BlacklistManager$Holder.class
 com\proxy\main\ProxyServer.class

@@ -57,9 +57,19 @@ public class HttpRequestProcessor {
             throws IOException, InterruptedException {
         String[] hostPort = urlString.split(":");
         String host = hostPort[0];
-        // Port mặc định cho HTTPS là 443
         int port = (hostPort.length > 1) ? Integer.parseInt(hostPort[1]) : 443;
 
+        // --- BƯỚC MỚI: KIỂM TRA BLACKLIST CHO HTTPS ---
+        // Gọi BlacklistManager đã kết nối với PostgreSQL
+        if (com.proxy.cache.BlacklistManager.getInstance().isBlocked(host)) {
+            // Gửi phản hồi 403 Proxy về trình duyệt
+            String forbiddenResponse = "HTTP/1.1 403 Forbidden\r\nProxy-agent: Clean-Java-Proxy\r\n\r\n";
+            clientOut.write(forbiddenResponse.getBytes());
+            clientOut.flush();
+            System.out.println("   [SECURITY] Blocked access to: " + host + " (HTTPS)");
+            return; // Dừng xử lý
+        }
+        // --- KẾT THÚC KIỂM TRA ---
         Socket serverSocket = null;
         try {
             // Bước 1: Kết nối Server đích (có thể lỗi nếu Server đích không phản hồi)
@@ -102,7 +112,15 @@ public class HttpRequestProcessor {
 
         try {
             String urlString = requestLine.split(" ")[1];
-
+            URL url = new URL(urlString);
+            String host = url.getHost();
+            if (com.proxy.cache.BlacklistManager.getInstance().isBlocked(host)) {
+                String forbiddenMessage = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nAccess Denied!";
+                clientOut.write(forbiddenMessage.getBytes());
+                clientOut.flush();
+                System.out.println("   [SECURITY] Blocked access to: " + host + " (HTTP)");
+                return; // Dừng xử lý
+            }
             // Bước 1: Kiểm tra Cache
             byte[] cachedData = cacheManager.get(urlString);
             if (cachedData != null) {
@@ -112,8 +130,6 @@ public class HttpRequestProcessor {
             }
 
             // Bước 2: Cache MISS - Phân tích URL và kết nối Server đích
-            URL url = new URL(urlString);
-            String host = url.getHost();
             int port = url.getPort() == -1 ? 80 : url.getPort();
 
             // Kết nối Server đích (sẽ có timeout 10s)
@@ -144,17 +160,94 @@ public class HttpRequestProcessor {
 
             // --- BƯỚC NHẬN RESPONSE ---
             ByteArrayOutputStream fullResponse = new ByteArrayOutputStream();
+            // Lớp serverIn (InputStream) đã có
             byte[] buffer = new byte[8192];
             int bytesRead;
 
-            try {
-                // Vòng lặp nhận dữ liệu (sẽ thoát sau 10s timeout nếu keep-alive)
-                while ((bytesRead = serverIn.read(buffer)) != -1) {
-                    fullResponse.write(buffer, 0, bytesRead);
+            // *Sử dụng BufferedReader để đọc Header (vì nó cần đọc từng dòng)*
+            BufferedReader serverReader = new BufferedReader(new InputStreamReader(serverIn));
+            String line;
+            int contentLength = -1;
+            boolean isChunked = false;
+            boolean headerFound = false;
+
+            // Đọc và phân tích Header
+            while ((line = serverReader.readLine()) != null) {
+                
+                fullResponse.write(headerLine.getBytes());
+
+                if (line.toLowerCase().startsWith("content-length:")) {
+                    try {
+                        contentLength = Integer.parseInt(line.substring("content-length:".length()).trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                } else if (line.toLowerCase().startsWith("transfer-encoding:")
+                        && line.toLowerCase().contains("chunked")) {
+                    isChunked = true;
                 }
-            } catch (SocketTimeoutException ignored) {
-                // Thoát khỏi vòng lặp Keep-Alive, đây là hành vi mong muốn.
+
+                if (line.isEmpty()) {
+                    headerFound = true;
+                    break; // Kết thúc Header
+                }
             }
+
+            // Nếu Header không tìm thấy (lỗi kết nối), thoát
+            if (!headerFound) {
+                System.err.println("   [ERROR] Failed to read HTTP Response Headers.");
+                throw new IOException("Failed to read HTTP Response Headers.");
+            }
+
+            // --- BƯỚC B2: ĐỌC BODY DỰA TRÊN HEADER HOẶC TIMEOUT ---
+
+            if (isChunked) {
+                // Để xử lý Chunked, chúng ta cần dùng thư viện hoặc chuyển sang NIO.
+                // Tạm thời, dùng timeout. Cần đóng serverReader để không làm hỏng stream.
+                System.err.println("   [WARNING] Encountered Chunked Encoding. Using Socket Timeout Fallback.");
+                // THỰC HIỆN LOGIC TIMEOUT FALLBACK CŨ:
+                try {
+                    while ((bytesRead = serverIn.read(buffer)) != -1) {
+                        fullResponse.write(buffer, 0, bytesRead);
+                    }
+                } catch (SocketTimeoutException ignored) {
+                    /* Exit loop */ }
+
+            } else if (contentLength != -1) {
+                // Đọc chính xác số byte (Content-Length)
+                System.out.println("   [DEBUG-READ] Reading exactly " + contentLength + " bytes (Content-Length).");
+                int totalBytesRead = 0;
+
+                // Vòng lặp đọc Body: LƯU Ý: Phải đọc từ InputStream gốc vì BufferedReader đã
+                // hoàn thành vai trò của nó.
+                // Dữ liệu còn lại trong InputStream là Body
+
+                while (totalBytesRead < contentLength && (bytesRead = serverIn.read(buffer)) != -1) {
+                    int bytesToRead = Math.min(bytesRead, contentLength - totalBytesRead);
+                    fullResponse.write(buffer, 0, bytesToRead);
+                    totalBytesRead += bytesToRead;
+
+                    if (totalBytesRead >= contentLength) {
+                        break; // Đã đọc đủ số byte
+                    }
+                }
+
+            } else {
+                // Không có Content-Length và không phải Chunked: Dùng timeout
+                System.err.println("   [WARNING] No Content-Length or Chunked. Using Socket Timeout Fallback.");
+                // THỰC HIỆN LOGIC TIMEOUT FALLBACK CŨ:
+                try {
+                    while ((bytesRead = serverIn.read(buffer)) != -1) {
+                        fullResponse.write(buffer, 0, bytesRead);
+                    }
+                } catch (SocketTimeoutException ignored) {
+                    /* Exit loop */ }
+            }
+
+            // Chú ý: Đảm bảo không gọi serverReader.close() để tránh đóng serverIn quá sớm.
+            // Dù vậy, việc trộn BufferedReader và InputStream gốc vẫn tiềm ẩn rủi ro trong
+            // Java.
+            // Tuy nhiên, đây là cách triển khai Task B chính xác nhất trong mô hình
+            // Blocking I/O.
 
             byte[] responseData = fullResponse.toByteArray();
 
