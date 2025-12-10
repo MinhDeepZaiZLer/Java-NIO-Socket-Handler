@@ -1,7 +1,13 @@
 com\proxy\cache\CacheManager$SingletonHelper.class
 com\proxy\main\ClientHandler.class
 com\proxy\cache\BlacklistManager.class
+com\proxy\core\usecase\ProxyRequestUseCase$HostPort.class
+com\proxy\core\usecase\ProxyRequestUseCase.class
+com\proxy\admin\AdminApp$2.class
+com\proxy\admin\AdminStatsUpdater.class
 com\proxy\io\TunnelingHelper.class
+com\proxy\main\NioConnectionHandler$State.class
+com\proxy\main\NioConnectionHandler.class
 com\example\App.class
 com\proxy\cache\CachedResponse.class
 com\proxy\io\TunnelingHelper$TransferData.class
@@ -9,5 +15,9 @@ com\proxy\data\BlockedHostDAO.class
 com\proxy\core\HttpRequestProcessor.class
 com\proxy\io\ConnectionEstablisher.class
 com\proxy\cache\CacheManager.class
+com\proxy\admin\AdminApp$1.class
+com\proxy\admin\AdminApp.class
+com\proxy\admin\AdminApp$ButtonEditor.class
+com\proxy\admin\AdminApp$ButtonRenderer.class
 com\proxy\cache\BlacklistManager$Holder.class
 com\proxy\main\ProxyServer.class
