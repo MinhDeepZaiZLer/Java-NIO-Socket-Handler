@@ -93,7 +93,7 @@ public class BlockedHostDAO {
      */
     public void addHost(String hostName) {
         String SQL = "INSERT INTO blocked_hosts(host_name, added_on) VALUES (?, NOW()) " +
-                    "ON CONFLICT (host_name) DO UPDATE SET updated_on = NOW()";
+                    "ON CONFLICT (host_name) DO NOTHING";
         
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(SQL)) {
