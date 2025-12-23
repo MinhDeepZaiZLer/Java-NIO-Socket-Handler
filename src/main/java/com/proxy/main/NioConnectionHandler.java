@@ -4,6 +4,7 @@ import com.proxy.cache.CacheManager;
 import com.proxy.core.usecase.ProxyRequestUseCase;
 import com.proxy.core.usecase.ProxyRequestUseCase.HostPort;
 
+import java.io.ByteArrayOutputStream; // Import mới
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -29,6 +30,10 @@ public class NioConnectionHandler {
   private final ProxyRequestUseCase useCase;
   private final CacheManager cacheManager;
 
+  // [NEW] Biến để tích lũy dữ liệu cho Cache
+  private final ByteArrayOutputStream responseAccumulator = new ByteArrayOutputStream();
+  private String currentRequestUrl = null;
+
   private enum State {
     READING_REQUEST_LINE, CONNECTING, FORWARDING
   }
@@ -49,11 +54,13 @@ public class NioConnectionHandler {
   }
 
   public void handleRead() throws IOException {
-    if (isClosed) return;
+
+    if (isClosed)
+      return;
 
     SocketChannel clientChannel = (SocketChannel) clientKey.channel();
     int bytesRead;
-    
+
     try {
       bytesRead = clientChannel.read(clientReadBuffer);
     } catch (IOException e) {
@@ -70,6 +77,8 @@ public class NioConnectionHandler {
       if (state == State.READING_REQUEST_LINE) {
         String requestLine = extractRequestLineFromBuffer();
         if (requestLine != null) {
+
+          // Xử lý Request để lấy thông tin Host/Port
           targetHostPort = useCase.processInitialRequest(requestLine);
 
           if (targetHostPort == null) {
@@ -78,32 +87,59 @@ public class NioConnectionHandler {
             return;
           }
 
+          // [CACHE LOGIC START] --------------------------------------
+          // Chỉ Cache HTTP thường, không Cache HTTPS Tunneling
+          if (!targetHostPort.isTunneling()) {
+            String[] parts = requestLine.split(" ");
+            if (parts.length > 1) {
+              this.currentRequestUrl = parts[1]; // Lưu URL để dùng khi save cache sau này
+
+              // 1. Kiểm tra Cache xem có hàng không?
+              byte[] cachedData = useCase.getCachedResponse(this.currentRequestUrl);
+
+              if (cachedData != null) {
+                System.out.println("   [NIO] Serving from CACHE: " + this.currentRequestUrl);
+
+                // Ghi dữ liệu Cache trả về Client
+                ByteBuffer cacheBuffer = ByteBuffer.wrap(cachedData);
+                while (cacheBuffer.hasRemaining()) {
+                  clientChannel.write(cacheBuffer);
+                }
+
+                // Đóng kết nối ngay, KHÔNG kết nối tới server đích
+                closeConnection();
+                return;
+              }
+            }
+          }
+
+          // [CACHE LOGIC END] ----------------------------------------
+
           state = State.CONNECTING;
-          
-          // Clear buffer for CONNECT tunneling
+
           if (targetHostPort.isTunneling()) {
             clientReadBuffer.clear();
+          } else {
+            // Forward request line cho HTTP thường
+            String requestWithClose = requestLine + "\r\nConnection: close\r\n";
+            serverWriteBuffer.put(requestWithClose.getBytes(StandardCharsets.ISO_8859_1));
           }
-          
+
           startNonBlockingConnect();
         }
       } else if (state == State.FORWARDING) {
-        // Client -> Server: Transfer data with overflow protection
+        // Forwarding logic cũ
         clientReadBuffer.flip();
-
         if (clientReadBuffer.hasRemaining()) {
-          // FIX: Check available space in serverWriteBuffer before putting
           int availableSpace = serverWriteBuffer.remaining();
           int dataToTransfer = Math.min(clientReadBuffer.remaining(), availableSpace);
-          
+
           if (dataToTransfer > 0) {
-            // Transfer only what fits
             int oldLimit = clientReadBuffer.limit();
             clientReadBuffer.limit(clientReadBuffer.position() + dataToTransfer);
             serverWriteBuffer.put(clientReadBuffer);
             clientReadBuffer.limit(oldLimit);
-            
-            // Enable server write
+
             if (serverKey != null && serverKey.isValid()) {
               serverKey.interestOps(serverKey.interestOps() | SelectionKey.OP_WRITE);
             } else {
@@ -111,8 +147,7 @@ public class NioConnectionHandler {
               return;
             }
           }
-          
-          // If serverWriteBuffer is full, disable client read until it drains
+
           if (serverWriteBuffer.remaining() == 0 && clientKey.isValid()) {
             clientKey.interestOps(clientKey.interestOps() & ~SelectionKey.OP_READ);
           }
@@ -123,26 +158,26 @@ public class NioConnectionHandler {
   }
 
   public void handleWrite() throws IOException {
-    if (isClosed) return;
+    if (isClosed)
+      return;
 
     SocketChannel clientChannel = (SocketChannel) clientKey.channel();
     clientWriteBuffer.flip();
-    
+
     try {
       clientChannel.write(clientWriteBuffer);
     } catch (IOException e) {
       closeConnection();
       throw e;
     }
-    
+
     if (clientWriteBuffer.hasRemaining()) {
       clientWriteBuffer.compact();
     } else {
       clientWriteBuffer.clear();
       if (clientKey.isValid()) {
         clientKey.interestOps(clientKey.interestOps() & ~SelectionKey.OP_WRITE);
-        
-        // Re-enable server read if it was disabled due to full buffer
+
         if (serverKey != null && serverKey.isValid()) {
           serverKey.interestOps(serverKey.interestOps() | SelectionKey.OP_READ);
         }
@@ -151,11 +186,12 @@ public class NioConnectionHandler {
   }
 
   public void handleServerRead(SelectionKey serverKey) throws IOException {
-    if (isClosed) return;
+    if (isClosed)
+      return;
 
     SocketChannel serverChannel = (SocketChannel) serverKey.channel();
     int bytesRead;
-    
+
     try {
       bytesRead = serverChannel.read(serverReadBuffer);
     } catch (IOException e) {
@@ -163,34 +199,54 @@ public class NioConnectionHandler {
       throw e;
     }
 
+    // [CACHE WRITE LOGIC START] ----------------------------------------
+    // Nếu Server đóng kết nối -> Lưu cache những gì đã gom được
     if (bytesRead == -1) {
+      if (currentRequestUrl != null && responseAccumulator.size() > 0) {
+        // Chỉ lưu cache nếu không phải Tunneling và có dữ liệu
+        if (targetHostPort != null && !targetHostPort.isTunneling()) {
+          cacheManager.put(currentRequestUrl, responseAccumulator.toByteArray());
+        }
+      }
       closeConnection();
       return;
     }
+    // [CACHE WRITE LOGIC END] ------------------------------------------
 
     if (bytesRead > 0) {
       serverReadBuffer.flip();
-      
-      // FIX: Check available space in clientWriteBuffer before putting
+
+      // [CACHE ACCUMULATE START] -------------------------------------
+      // Copy dữ liệu server trả về vào bộ nhớ tạm để dành Cache
+      if (currentRequestUrl != null && !targetHostPort.isTunneling()) {
+        byte[] dataCopy = new byte[serverReadBuffer.remaining()];
+        serverReadBuffer.get(dataCopy); // Đọc ra
+        try {
+          responseAccumulator.write(dataCopy);
+        } catch (IOException e) {
+          e.printStackTrace();
+        } // Lưu lại
+        serverReadBuffer.rewind(); // Tua lại để gửi cho Client như bình thường
+      }
+      // [CACHE ACCUMULATE END] ---------------------------------------
+
+      // Logic forwarding cũ
       int availableSpace = clientWriteBuffer.remaining();
       int dataToTransfer = Math.min(serverReadBuffer.remaining(), availableSpace);
-      
+
       if (dataToTransfer > 0) {
-        // Transfer only what fits
         int oldLimit = serverReadBuffer.limit();
         serverReadBuffer.limit(serverReadBuffer.position() + dataToTransfer);
         clientWriteBuffer.put(serverReadBuffer);
         serverReadBuffer.limit(oldLimit);
-        
-        // Enable client write
+
         if (clientKey.isValid()) {
           clientKey.interestOps(clientKey.interestOps() | SelectionKey.OP_WRITE);
         }
       }
-      
+
       serverReadBuffer.compact();
-      
-      // If clientWriteBuffer is full, disable server read until it drains
+
       if (clientWriteBuffer.remaining() == 0 && serverKey.isValid()) {
         serverKey.interestOps(serverKey.interestOps() & ~SelectionKey.OP_READ);
       }
@@ -198,10 +254,11 @@ public class NioConnectionHandler {
   }
 
   public void handleServerConnect(SelectionKey serverKey) throws IOException {
-    if (isClosed) return;
+    if (isClosed)
+      return;
 
     SocketChannel serverChannel = (SocketChannel) serverKey.channel();
-    
+
     try {
       if (serverChannel.isConnectionPending()) {
         serverChannel.finishConnect();
@@ -212,34 +269,31 @@ public class NioConnectionHandler {
       throw e;
     }
 
-    System.out.println("  [NIO] Server connection established: " + 
+    System.out.println("  [NIO] Server connection established: " +
         (targetHostPort != null ? targetHostPort.getHost() + ":" + targetHostPort.getPort() : "unknown"));
 
     state = State.FORWARDING;
-    
+
     if (!serverKey.isValid()) {
       closeConnection();
       return;
     }
-    
+
     serverKey.interestOps(SelectionKey.OP_READ);
 
     if (targetHostPort != null && targetHostPort.isTunneling()) {
-      // Send CONNECT response
       String connectResponse = "HTTP/1.1 200 Connection Established\r\nProxy-agent: Clean-Java-Proxy\r\n\r\n";
       clientWriteBuffer.put(connectResponse.getBytes(StandardCharsets.ISO_8859_1));
       if (clientKey.isValid()) {
         clientKey.interestOps(clientKey.interestOps() | SelectionKey.OP_WRITE);
       }
     } else {
-      // HTTP: Forward initial request to server
       clientReadBuffer.flip();
-      
+
       if (clientReadBuffer.hasRemaining()) {
-        // FIX: Check space before putting
         int availableSpace = serverWriteBuffer.remaining();
         int dataToTransfer = Math.min(clientReadBuffer.remaining(), availableSpace);
-        
+
         if (dataToTransfer > 0) {
           int oldLimit = clientReadBuffer.limit();
           clientReadBuffer.limit(clientReadBuffer.position() + dataToTransfer);
@@ -259,27 +313,28 @@ public class NioConnectionHandler {
     }
   }
 
+  // Các hàm phụ trợ giữ nguyên
   public void handleServerWrite(SelectionKey serverKey) throws IOException {
-    if (isClosed) return;
+    if (isClosed)
+      return;
 
     SocketChannel serverChannel = (SocketChannel) serverKey.channel();
     serverWriteBuffer.flip();
-    
+
     try {
       serverChannel.write(serverWriteBuffer);
     } catch (IOException e) {
       closeConnection();
       throw e;
     }
-    
+
     if (serverWriteBuffer.hasRemaining()) {
       serverWriteBuffer.compact();
     } else {
       serverWriteBuffer.clear();
       if (serverKey.isValid()) {
         serverKey.interestOps(serverKey.interestOps() & ~SelectionKey.OP_WRITE);
-        
-        // Re-enable client read if it was disabled due to full buffer
+
         if (clientKey.isValid()) {
           clientKey.interestOps(clientKey.interestOps() | SelectionKey.OP_READ);
         }
@@ -290,29 +345,28 @@ public class NioConnectionHandler {
   private void deregisterAndClose(SelectionKey key) {
     if (key != null) {
       try {
-        if (key.isValid()) {
+        if (key.isValid())
           key.cancel();
-        }
       } catch (Exception ignored) {
       }
-      
+
       try {
-        if (key.channel() != null && key.channel().isOpen()) {
+        if (key.channel() != null && key.channel().isOpen())
           key.channel().close();
-        }
       } catch (IOException ignored) {
       }
     }
   }
 
   public void closeConnection() {
-    if (isClosed) return;
+    if (isClosed)
+      return;
     isClosed = true;
 
+    // Lưu ý: Đóng ByteArrayOutputStream là không bắt buộc nhưng tốt cho thói quen
     try {
-      System.out.println("  [NIO] Closing connection for client: " + 
-          (clientKey.channel() != null ? clientKey.channel().toString() : "null"));
-    } catch (Exception ignored) {
+      responseAccumulator.close();
+    } catch (IOException e) {
     }
 
     deregisterAndClose(clientKey);
@@ -321,12 +375,11 @@ public class NioConnectionHandler {
       deregisterAndClose(serverKey);
       serverKey = null;
     }
-    
+
     if (serverChannel != null) {
       try {
-        if (serverChannel.isOpen()) {
+        if (serverChannel.isOpen())
           serverChannel.close();
-        }
       } catch (IOException ignored) {
       }
       serverChannel = null;
@@ -338,7 +391,7 @@ public class NioConnectionHandler {
       closeConnection();
       return;
     }
-    
+
     try {
       serverChannel = SocketChannel.open();
       serverChannel.configureBlocking(false);
@@ -347,7 +400,7 @@ public class NioConnectionHandler {
       serverKey = serverChannel.register(selector, SelectionKey.OP_CONNECT);
       serverKey.attach(this);
     } catch (IOException e) {
-      System.err.println("  [NIO ERROR] Failed to start connection to " + 
+      System.err.println("  [NIO ERROR] Failed to start connection to " +
           targetHostPort.getHost() + ":" + targetHostPort.getPort() + " - " + e.getMessage());
       closeConnection();
       throw e;
@@ -355,17 +408,16 @@ public class NioConnectionHandler {
   }
 
   private void sendForbiddenResponse(SocketChannel clientChannel, boolean isTunneling) throws IOException {
-    String forbiddenResponse = isTunneling 
+    String forbiddenResponse = isTunneling
         ? "HTTP/1.1 403 Forbidden\r\nProxy-agent: Clean-Java-Proxy\r\n\r\n"
         : "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nAccess Denied!";
-    
+
     ByteBuffer buffer = ByteBuffer.wrap(forbiddenResponse.getBytes(StandardCharsets.ISO_8859_1));
     try {
       while (buffer.hasRemaining()) {
         clientChannel.write(buffer);
       }
     } catch (IOException ignored) {
-      // Client may have already disconnected
     }
   }
 
@@ -373,7 +425,7 @@ public class NioConnectionHandler {
     clientReadBuffer.flip();
     int limit = clientReadBuffer.limit();
     int requestLineEnd = -1;
-    
+
     for (int i = clientReadBuffer.position(); i < limit - 1; i++) {
       if (clientReadBuffer.get(i) == '\r' && clientReadBuffer.get(i + 1) == '\n') {
         requestLineEnd = i;

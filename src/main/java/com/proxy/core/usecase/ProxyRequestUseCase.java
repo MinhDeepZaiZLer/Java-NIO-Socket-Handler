@@ -27,6 +27,10 @@ public class ProxyRequestUseCase {
         String[] parts = requestLine.split(" ");
         if (parts.length < 3) return null;
         
+        // --- [SỬA 1] TĂNG BIẾN ĐẾM TOTAL REQUESTS ---
+        // Mỗi khi có request hợp lệ đi vào đây, ta tăng số lượng request lên
+        cacheManager.incrementTotalRequests();
+
         String method = parts[0];
         String urlString = parts[1];
         
@@ -59,12 +63,23 @@ public class ProxyRequestUseCase {
             return null; // Bị chặn
         }
         
-        // Ghi chú: Logic Cache GET/HIT sẽ được xử lý ở tầng Infrastructure 
-        // hoặc một Use Case khác để đơn giản hóa giao tiếp NIO.
-
         return hp;
     }
     
+    /**
+     * --- [SỬA 2] HÀM LẤY CACHE CÓ KÈM LOGIC ĐẾM HIT ---
+     * NioConnectionHandler nên gọi hàm này thay vì gọi trực tiếp cacheManager.get()
+     * để đảm bảo cacheHits được tính toán đúng.
+     */
+    public byte[] getCachedResponse(String url) {
+        byte[] data = cacheManager.get(url);
+        if (data != null) {
+            // Nếu có dữ liệu -> Tăng biến đếm Hit
+            cacheManager.incrementCacheHit();
+        }
+        return data;
+    }
+
     /**
      * DTO (Data Transfer Object) chứa thông tin Host đích.
      */

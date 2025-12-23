@@ -212,17 +212,17 @@ public class AdminApp extends JFrame {
         blacklistTable.setIntercellSpacing(new Dimension(0, 0));
         blacklistTable.setSelectionBackground(new Color(52, 152, 219, 50));
         
-        // Cải thiện header: Tăng độ dày chữ và căn giữa
+     
         JTableHeader header = blacklistTable.getTableHeader();
         header.setFont(new Font("Segoe UI", Font.BOLD, 13));
         header.setBackground(new Color(245, 245, 245));
         header.setForeground(DARK_BG);
 
-        // Column widths
+   
         blacklistTable.getColumnModel().getColumn(0).setMaxWidth(50);
         blacklistTable.getColumnModel().getColumn(2).setPreferredWidth(150);
         blacklistTable.getColumnModel().getColumn(3).setPreferredWidth(100);
-        blacklistTable.getColumnModel().getColumn(4).setPreferredWidth(100); // Tăng 1 chút
+        blacklistTable.getColumnModel().getColumn(4).setPreferredWidth(100); 
 
         // Căn chỉnh nội dung cột
         DefaultTableCellRenderer centerRenderer = new DefaultTableCellRenderer();
@@ -500,14 +500,25 @@ public class AdminApp extends JFrame {
 
     // Method to update cache statistics from outside
     public void updateCacheStats(int hits, int total) {
-        SwingUtilities.invokeLater(() -> {
-            this.cacheHits = hits;
-            this.totalRequests = total;
-            double hitRate = total > 0 ? (hits * 100.0 / total) : 0;
-            cacheHitsLabel.setText(String.format("%d (%.2f%%)", hits, hitRate));
-            requestCountLabel.setText(String.valueOf(total));
-        });
-    }
+    SwingUtilities.invokeLater(() -> {
+        this.cacheHits = hits;
+        this.totalRequests = total;
+        
+        // Tránh chia cho 0 và tính toán tỷ lệ
+        double hitRate = total > 0 ? (hits * 100.0 / total) : 0;
+        
+        // Cập nhật Label "Cache Performance" (⚡)
+        cacheHitsLabel.setText(String.format("%d (%.2f%%)", hits, hitRate));
+        
+        // Cập nhật Label "Total Requests" (📊)
+        requestCountLabel.setText(String.valueOf(total));
+        
+        // Hiệu ứng đổi màu nếu Hit Rate cao (Tùy chọn)
+        if (hitRate > 50) {
+            cacheHitsLabel.setForeground(SUCCESS_COLOR);
+        }
+    });
+}
 
     // Method to update active connections
     public void updateActiveConnections(int count) {

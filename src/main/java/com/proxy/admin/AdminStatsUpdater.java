@@ -3,8 +3,8 @@ package com.proxy.admin;
 import com.proxy.cache.CacheManager;
 
 /**
- * Bridge class to update AdminApp statistics from ProxyServer
- * Thread-safe singleton to avoid concurrency issues
+ * Cầu nối cập nhật thống kê từ Server sang AdminApp (UI).
+ * Đảm bảo Thread-safe và đồng bộ dữ liệu chính xác.
  */
 public class AdminStatsUpdater {
     
@@ -12,7 +12,9 @@ public class AdminStatsUpdater {
     private AdminApp adminApp;
     private CacheManager cacheManager;
     
-    private volatile int totalRequests = 0;
+    // Biến này đếm số kết nối TCP (Socket) từ ProxyServer
+    private volatile int totalTcpConnections = 0; 
+    
     private volatile int blockedRequests = 0;
     private volatile int activeConnections = 0;
     
@@ -25,38 +27,29 @@ public class AdminStatsUpdater {
         return instance;
     }
     
-    /**
-     * Set the AdminApp instance to update
-     */
     public void setAdminApp(AdminApp adminApp) {
         this.adminApp = adminApp;
     }
     
-    /**
-     * Set the CacheManager to get cache statistics
-     */
     public void setCacheManager(CacheManager cacheManager) {
         this.cacheManager = cacheManager;
     }
     
     /**
-     * Increment total request count
+     * Hàm này được gọi từ ProxyServer khi có kết nối TCP mới (handleAccept).
+     * Chúng ta dùng nó để kích hoạt việc cập nhật UI.
      */
     public synchronized void incrementTotalRequests() {
-        totalRequests++;
+        totalTcpConnections++;
         updateAdminUI();
     }
     
-    /**
-     * Increment blocked request count
-     */
     public synchronized void incrementBlockedRequests() {
         blockedRequests++;
+        // Có thể cập nhật UI ngay nếu muốn
+        updateAdminUI(); 
     }
     
-    /**
-     * Update active connection count
-     */
     public synchronized void setActiveConnections(int count) {
         activeConnections = count;
         if (adminApp != null) {
@@ -65,48 +58,47 @@ public class AdminStatsUpdater {
     }
     
     /**
-     * Update AdminApp UI with current statistics
+     * Cập nhật UI: Đây là phần quan trọng nhất đã được sửa.
      */
     private void updateAdminUI() {
         if (adminApp != null && cacheManager != null) {
+            // Lấy số liệu thực tế từ CacheManager
             int cacheHits = cacheManager.getCacheHits();
-            adminApp.updateCacheStats(cacheHits, totalRequests);
+            
+            // [QUAN TRỌNG] Lấy Total Requests từ CacheManager (HTTP Requests)
+            // Thay vì dùng biến totalTcpConnections cục bộ.
+            // Điều này giúp tính đúng tỷ lệ: (Hits / HTTP Requests) * 100
+            int totalHttpRequests = cacheManager.getTotalRequests();
+            
+            // Cập nhật thẻ "Cache Performance" và "Total Requests" trên giao diện
+            adminApp.updateCacheStats(cacheHits, totalHttpRequests);
         }
     }
     
     /**
-     * Manually refresh all statistics
+     * Làm mới toàn bộ thống kê thủ công (gọi định kỳ từ ProxyServer)
      */
     public void refreshStats() {
         updateAdminUI();
+        if (adminApp != null) {
+            adminApp.updateActiveConnections(activeConnections);
+        }
     }
     
-    /**
-     * Get total requests count
-     */
     public int getTotalRequests() {
-        return totalRequests;
+        return totalTcpConnections;
     }
     
-    /**
-     * Get blocked requests count
-     */
     public int getBlockedRequests() {
         return blockedRequests;
     }
     
-    /**
-     * Get active connections count
-     */
     public int getActiveConnections() {
         return activeConnections;
     }
     
-    /**
-     * Reset all statistics
-     */
     public synchronized void resetStats() {
-        totalRequests = 0;
+        totalTcpConnections = 0;
         blockedRequests = 0;
         activeConnections = 0;
         updateAdminUI();
